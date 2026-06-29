@@ -27,10 +27,10 @@ import pystray
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PROMPT_PATH = BASE_DIR / "prompts" / "editor_mensagens.txt"
+PROMPT_PATH = BASE_DIR / "prompts" / "editor_mensagens.md"
 
 # Altere esta constante para trocar o atalho global principal.
-MAIN_HOTKEY = "ctrl+alt+m"
+MAIN_HOTKEY = "alt+h"
 
 DEFAULT_MODEL = "gpt-5.4-mini"
 WINDOWS_DICTATION_DELAY_MS = 450
@@ -318,7 +318,7 @@ def notify_already_running() -> None:
 
 
 def _parse_hotkey(hotkey: str) -> tuple[int, int]:
-    """Converte, por exemplo, ``ctrl+alt+m`` para valores da Win32 API."""
+    """Converte, por exemplo, ``alt+h`` para valores da Win32 API."""
     modifier_values = {
         "alt": MOD_ALT,
         "ctrl": MOD_CONTROL,
@@ -340,7 +340,7 @@ def _parse_hotkey(hotkey: str) -> tuple[int, int]:
     if not modifiers or len(main_keys) != 1:
         raise ConfigurationError(
             "O atalho deve ter ao menos um modificador e uma tecla, "
-            "por exemplo: ctrl+alt+m."
+            "por exemplo: ctrl+alt+m ou alt+h."
         )
 
     main_key = main_keys[0]
