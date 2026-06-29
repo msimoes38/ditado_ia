@@ -151,7 +151,31 @@ São aceitos os modificadores `ctrl`, `alt`, `shift` e `win`, combinados com uma
 
 ## Prompt de edição
 
-O comportamento da reescrita fica em `prompts/editor_mensagens.txt`. É possível editar esse arquivo sem alterar o código. A resposta da API é usada como texto final e deve conter somente a mensagem reescrita.
+As instruções enviadas ao modelo são montadas a partir de três arquivos em
+`prompts/`:
+
+- `editor_mensagens.md` define as regras gerais de revisão, preservação do
+  sentido e adaptação ao gênero textual;
+- `perfil_usuario.md` descreve o contexto profissional e as preferências de
+  redação do usuário;
+- `glossario.md` registra siglas e termos recorrentes para ajudar o modelo a
+  reconhecer o vocabulário esperado.
+
+Esses arquivos são textos UTF-8 comuns e podem ser editados para personalizar o
+comportamento sem alterar o código. O prompt principal é obrigatório. Se o perfil
+ou o glossário não estiver disponível, a aplicação mostra um aviso no terminal e
+continua usando os demais arquivos.
+
+O modelo infere automaticamente o tom adequado pelo conteúdo: curto e natural
+para WhatsApp ou chat, educado e objetivo para e-mail profissional, ou formal,
+técnico e impessoal para textos administrativos e jurídicos. O texto a reescrever
+é enviado separadamente dessas instruções e a resposta da API deve conter somente
+o texto final.
+
+Perguntas, pedidos e comandos presentes no texto de entrada são tratados como
+material a revisar, não como solicitações dirigidas ao modelo. Por exemplo,
+`qual é a capital da França` deve ser revisado para
+`Qual é a capital da França?`, sem que o modelo responda à pergunta.
 
 ## Solução de problemas
 

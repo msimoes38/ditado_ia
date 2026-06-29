@@ -1,0 +1,12 @@
+SEI = Sistema Eletrônico de Informações
+SAAJ = Sistema de Acompanhamento de Ações Judiciais
+AIIM = Auto de Infração e Imposição de Multa
+NF.1 = unidade interna
+NF.2 = unidade interna
+DT = Delegacia Tributária
+DT = Delegacia Tributária
+PGE = Procuradoria Geral do Estado
+ICMS = Imposto sobre Circulação de Mercadorias e Serviços
+DIFAL = Diferencial de Alíquotas
+MS = mandado de segurança
+SAA = Setor de Apoio Administrativo

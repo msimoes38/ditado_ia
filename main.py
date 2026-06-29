@@ -27,7 +27,10 @@ import pystray
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PROMPT_PATH = BASE_DIR / "prompts" / "editor_mensagens.md"
+PROMPTS_DIR = BASE_DIR / "prompts"
+PROMPT_PATH = PROMPTS_DIR / "editor_mensagens.md"
+USER_PROFILE_PATH = PROMPTS_DIR / "perfil_usuario.md"
+GLOSSARY_PATH = PROMPTS_DIR / "glossario.md"
 
 # Altere esta constante para trocar o atalho global principal.
 MAIN_HOTKEY = "alt+h"
@@ -594,8 +597,31 @@ def stop_tray_icon() -> None:
     APP.tray_ready.clear()
 
 
+def _load_optional_context(path: Path, context_name: str) -> str | None:
+    """Carrega contexto opcional sem impedir o funcionamento do aplicativo."""
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        LOGGER.warning(
+            "Contexto opcional '%s' indisponível em %s; continuando sem ele: %s",
+            context_name,
+            path,
+            exc,
+        )
+        return None
+
+    if not content:
+        LOGGER.warning(
+            "Contexto opcional '%s' está vazio em %s; continuando sem ele.",
+            context_name,
+            path,
+        )
+        return None
+    return content
+
+
 def load_prompt() -> str:
-    """Carrega o prompt fixo usado para editar o texto ditado."""
+    """Monta as instruções com o editor e os contextos disponíveis."""
     try:
         prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
     except OSError as exc:
@@ -605,7 +631,21 @@ def load_prompt() -> str:
 
     if not prompt:
         raise ConfigurationError("O arquivo de prompt está vazio.")
-    return prompt
+
+    instruction_sections = [("INSTRUÇÕES DE EDIÇÃO", prompt)]
+    optional_contexts = (
+        ("PERFIL DO USUÁRIO", USER_PROFILE_PATH, "perfil do usuário"),
+        ("GLOSSÁRIO", GLOSSARY_PATH, "glossário"),
+    )
+    for heading, path, context_name in optional_contexts:
+        content = _load_optional_context(path, context_name)
+        if content:
+            instruction_sections.append((heading, content))
+
+    return "\n\n".join(
+        f"## {heading}\n\n{content}"
+        for heading, content in instruction_sections
+    )
 
 
 def encode_spoken_structure_commands(raw_text: str) -> str:

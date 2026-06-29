@@ -25,7 +25,7 @@ Não grave áudio, não envie áudio à OpenAI e não implemente restauração d
 ## Arquivos importantes
 
 - `main.py`: aplicação, interface, atalho nativo, chamada à API e cópia para o clipboard.
-- `prompts/editor_mensagens.txt`: instruções fixas enviadas ao modelo.
+- `prompts/editor_mensagens.md`: instruções fixas enviadas ao modelo.
 - `requirements.txt`: dependências de execução.
 - `.env.example`: nomes e valores de exemplo das variáveis de ambiente.
 - `README.md`: instalação, operação e solução de problemas para o usuário.
