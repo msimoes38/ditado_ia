@@ -56,13 +56,23 @@ $env:OPENAI_TEXT_MODEL = "gpt-5.4-mini"
 
 ## Execução e uso
 
-Com o ambiente virtual ativado, execute:
+Para o uso normal, dê um duplo clique em `chama_ditado.bat` ou execute:
+
+```powershell
+.\chama_ditado.bat
+```
+
+O launcher usa `pythonw.exe`: nenhum terminal fica aberto e um ícone de
+microfone permanece na área de notificação. Se ele não estiver visível ao
+lado do relógio, abra a lista de ícones ocultos da barra de tarefas.
+
+Para diagnóstico, também é possível iniciar com console:
 
 ```powershell
 python main.py
 ```
 
-O terminal exibirá `Aguardando atalho Ctrl + Alt + M...`.
+Nesse modo, as mesmas mensagens da aplicação também aparecem no terminal.
 
 1. Clique no campo do programa em que deseja inserir a mensagem.
 2. Pressione `Ctrl + Alt + M`.
@@ -75,6 +85,36 @@ O terminal exibirá `Aguardando atalho Ctrl + Alt + M...`.
 Se não quiser usar a API, clique em **Copiar texto bruto**. O conteúdo da caixa será copiado sem alterações e a janela fechará imediatamente.
 
 Pressione `Esc` ou clique em **Cancelar** para fechar sem copiar. Se o painel de digitação por voz não abrir automaticamente, confirme nas configurações do Windows se o reconhecimento de fala online está habilitado e teste `Win + H` manualmente em uma caixa de texto.
+
+## Ícone da área de notificação
+
+O ícone permanece visível durante toda a execução e indica que o atalho
+global está ativo. Um clique principal abre a janela de ditado. O menu do
+ícone oferece:
+
+- **Abrir ditado**: executa o mesmo fluxo iniciado por `Ctrl + Alt + M`;
+- **Ver mensagens**: abre o histórico técnico da sessão;
+- **Encerrar**: fecha a aplicação e libera o atalho global e o controle de
+  instância única.
+
+Use **Encerrar** para finalizar quando a aplicação tiver sido aberta pelo
+launcher sem console.
+
+## Mensagens e arquivos de log
+
+A janela **Mensagens da aplicação** mostra, em tempo real, até as 2.000
+entradas mais recentes da sessão. Ela também permite abrir a pasta dos logs.
+
+As mensagens são gravadas em UTF-8 em:
+
+```text
+%LOCALAPPDATA%\DitadoInteligente\logs\ditado-inteligente.log
+```
+
+O arquivo é rotacionado ao atingir 1 MiB e são mantidos três backups. Se a
+gravação no arquivo não estiver disponível, o aplicativo continua funcionando
+e mantém o histórico da sessão em memória. O texto ditado, o texto reescrito e
+a chave da API não são incluídos nos logs.
 
 ## Comandos falados de estrutura
 
@@ -89,11 +129,11 @@ O botão **Copiar texto bruto** não interpreta esses comandos e copia as frases
 
 ## Atalho global
 
-O atalho é registrado diretamente pela API do Windows. Caso outra aplicação já use a mesma combinação, o programa encerrará com uma mensagem clara no terminal. Se o atalho não for registrado:
+O atalho é registrado diretamente pela API do Windows. Caso outra aplicação já use a mesma combinação, o programa encerrará com uma mensagem nativa e registrará os detalhes no log. Se o atalho não for registrado:
 
 - confira se outro programa já usa `Ctrl + Alt + M`;
 - escolha outra combinação na constante abaixo;
-- mantenha o terminal aberto enquanto usa o ditado.
+- consulte a mensagem de inicialização e o arquivo de log.
 
 Executar como administrador não deve ser necessário para capturar o atalho. A colagem é feita manualmente pelo usuário.
 
@@ -115,7 +155,9 @@ O comportamento da reescrita fica em `prompts/editor_mensagens.txt`. É possíve
 
 ## Solução de problemas
 
-- **Detalhes para diagnóstico:** as falhas capturadas exibem o traceback completo na caixa de erro e no terminal. Falhas ocorridas durante a inicialização são exibidas no terminal.
+- **Detalhes para diagnóstico:** as falhas capturadas exibem o traceback completo na caixa de erro, na janela **Mensagens da aplicação**, no arquivo de log e, quando existente, no terminal. Falhas de inicialização também são mostradas em uma caixa nativa mesmo sob `pythonw.exe`.
+- **Ícone ausente:** procure-o entre os ícones ocultos da barra de tarefas. Se ele realmente não tiver sido criado, a aplicação exibirá uma falha de inicialização e será encerrada para não permanecer invisível.
+- **Arquivo de log indisponível:** abra **Ver mensagens** pelo ícone; o histórico da sessão continuará disponível em memória.
 - **Chave ausente:** preencha `OPENAI_API_KEY` no `.env` e reinicie o programa.
 - **Texto vazio:** dite ou digite algo antes de confirmar.
 - **Falha da API:** confira a chave, o modelo, a conexão e os limites da conta. O texto bruto permanece na janela.
@@ -123,4 +165,5 @@ O comportamento da reescrita fica em `prompts/editor_mensagens.txt`. É possíve
 - **Atalho não registrado:** feche o programa que usa a mesma combinação ou escolha outro atalho.
 - **Aplicativo já em execução:** use a instância que já está aguardando o atalho; não é necessário abrir outra.
 
-Para encerrar, pressione `Ctrl + C` no terminal ou feche o terminal.
+Para encerrar, escolha **Encerrar** no ícone da área de notificação. No modo de
+diagnóstico também é possível pressionar `Ctrl + C` no terminal.

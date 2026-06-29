@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from collections import deque
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import queue
 import re
@@ -19,6 +22,8 @@ from typing import Any, Literal
 import pyautogui
 from dotenv import load_dotenv
 from openai import OpenAI
+from PIL import Image, ImageDraw
+import pystray
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -34,12 +39,17 @@ COPY_CONFIRMATION_DELAY_MS = 1000
 CLIPBOARD_START_DELAY_MS = 250
 CLIPBOARD_COPY_MAX_ATTEMPTS = 5
 CLIPBOARD_RETRY_DELAY_MS = 100
+LOG_HISTORY_MAX_RECORDS = 2000
+LOG_FILE_MAX_BYTES = 1024 * 1024
+LOG_FILE_BACKUP_COUNT = 3
+TRAY_START_TIMEOUT_SECONDS = 3.0
 INSTANCE_MUTEX_NAME = r"Local\DitadoInteligenteOpenAI"
 HOTKEY_ID = 1
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
 ERROR_ALREADY_EXISTS = 183
 MB_OK = 0x0000
+MB_ICONERROR = 0x0010
 MB_ICONINFORMATION = 0x0040
 MB_TOPMOST = 0x00040000
 MOD_ALT = 0x0001
@@ -79,18 +89,131 @@ class AppState:
     status_label: ttk.Label | None = None
     copy_confirmation_overlay: tk.Frame | None = None
     copy_confirmation_label: tk.Label | None = None
+    log_window: tk.Toplevel | None = None
+    log_text_box: tk.Text | None = None
+    log_file_path: Path | None = None
+    log_rendered_revision: int = -1
     instance_mutex_handle: int | None = None
     hotkey_thread: threading.Thread | None = None
     hotkey_thread_id: int | None = None
     hotkey_ready: threading.Event = field(default_factory=threading.Event)
     hotkey_error: str | None = None
+    tray_icon: Any = None
+    tray_thread: threading.Thread | None = None
+    tray_ready: threading.Event = field(default_factory=threading.Event)
+    tray_error: BaseException | None = None
+    tray_stopping: bool = False
     operation_id: int = 0
     busy: bool = False
     closing_after_copy: bool = False
+    shutting_down: bool = False
 
 
 APP = AppState()
 UI_EVENTS: queue.Queue[tuple[str, Any]] = queue.Queue()
+LOGGER = logging.getLogger("ditado_inteligente")
+LOG_HISTORY: deque[str] = deque(maxlen=LOG_HISTORY_MAX_RECORDS)
+LOG_HISTORY_LOCK = threading.Lock()
+LOG_HISTORY_REVISION = 0
+
+
+class SessionHistoryHandler(logging.Handler):
+    """Mantém um histórico limitado sem tocar em widgets Tkinter."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        global LOG_HISTORY_REVISION
+
+        try:
+            message = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+
+        with LOG_HISTORY_LOCK:
+            LOG_HISTORY.append(message)
+            LOG_HISTORY_REVISION += 1
+
+
+def _get_log_directory() -> Path:
+    local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+    if not local_app_data:
+        raise OSError("A variável LOCALAPPDATA não está disponível.")
+    return Path(local_app_data) / "DitadoInteligente" / "logs"
+
+
+def _configure_logging() -> None:
+    """Configura console, histórico da sessão e arquivo rotativo."""
+    global LOG_HISTORY_REVISION
+
+    _close_logging_handlers()
+    with LOG_HISTORY_LOCK:
+        LOG_HISTORY.clear()
+        LOG_HISTORY_REVISION += 1
+
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(threadName)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    history_handler = SessionHistoryHandler()
+    history_handler.setFormatter(formatter)
+    LOGGER.addHandler(history_handler)
+
+    if sys.stdout is not None:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        LOGGER.addHandler(console_handler)
+
+    APP.log_file_path = None
+    try:
+        log_directory = _get_log_directory()
+        log_directory.mkdir(parents=True, exist_ok=True)
+        log_file_path = log_directory / "ditado-inteligente.log"
+        file_handler = RotatingFileHandler(
+            log_file_path,
+            maxBytes=LOG_FILE_MAX_BYTES,
+            backupCount=LOG_FILE_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        LOGGER.addHandler(file_handler)
+        APP.log_file_path = log_file_path
+    except OSError as exc:
+        LOGGER.warning(
+            "Não foi possível habilitar o arquivo de log; as mensagens "
+            "continuarão disponíveis nesta sessão: %s",
+            exc,
+        )
+
+
+def _close_logging_handlers() -> None:
+    for handler in list(LOGGER.handlers):
+        LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
+def _log_history_snapshot() -> tuple[int, list[str]]:
+    with LOG_HISTORY_LOCK:
+        return LOG_HISTORY_REVISION, list(LOG_HISTORY)
+
+
+def _write_console_fallback(message: str, *, error: bool = False) -> None:
+    """Escreve antes do logging existir, inclusive sob pythonw."""
+    stream = sys.stderr if error else sys.stdout
+    if stream is None:
+        stream = sys.stdout if error else sys.stderr
+    if stream is None:
+        return
+    try:
+        stream.write(f"{message}\n")
+        stream.flush()
+    except OSError:
+        pass
 
 
 def _windows_user32() -> Any:
@@ -185,7 +308,7 @@ def release_single_instance() -> None:
 def notify_already_running() -> None:
     """Informa no terminal e em uma caixa nativa que o app já está aberto."""
     message = "O ditado inteligente já está em execução."
-    print(message, flush=True)
+    _write_console_fallback(message)
     _windows_user32().MessageBoxW(
         None,
         message,
@@ -334,11 +457,141 @@ def _global_hotkey_message_loop(modifiers: int, virtual_key: int) -> None:
                     "Falha ao ler a fila do atalho global do Windows.",
                 )
             if message.message == WM_HOTKEY and message.wParam == HOTKEY_ID:
-                print("Atalho global detectado.", flush=True)
+                LOGGER.info("Atalho global detectado.")
                 _request_dictation_window()
     finally:
         user32.UnregisterHotKey(None, HOTKEY_ID)
         APP.hotkey_thread_id = None
+
+
+def _create_tray_image() -> Image.Image:
+    """Gera um microfone simples e legível em tamanhos pequenos."""
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((3, 3, 60, 60), radius=14, fill="#1769AA")
+    draw.rounded_rectangle((25, 13, 39, 38), radius=7, fill="white")
+    draw.arc((18, 22, 46, 49), start=0, end=180, fill="white", width=4)
+    draw.line((32, 48, 32, 53), fill="white", width=4)
+    draw.line((24, 53, 40, 53), fill="white", width=4)
+    return image
+
+
+def _tray_open_dictation(icon: Any = None, item: Any = None) -> None:
+    UI_EVENTS.put(("open_window", None))
+
+
+def _tray_open_messages(icon: Any = None, item: Any = None) -> None:
+    UI_EVENTS.put(("open_log_window", None))
+
+
+def _tray_request_shutdown(icon: Any = None, item: Any = None) -> None:
+    UI_EVENTS.put(("shutdown", None))
+
+
+def _build_tray_menu() -> pystray.Menu:
+    return pystray.Menu(
+        pystray.MenuItem(
+            "Abrir ditado",
+            _tray_open_dictation,
+            default=True,
+        ),
+        pystray.MenuItem("Ver mensagens", _tray_open_messages),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Encerrar", _tray_request_shutdown),
+    )
+
+
+def _tray_setup(icon: pystray.Icon) -> None:
+    try:
+        icon.visible = True
+    except Exception as exc:
+        APP.tray_error = exc
+    finally:
+        APP.tray_ready.set()
+
+
+def _tray_run_loop() -> None:
+    icon = APP.tray_icon
+    if icon is None:
+        return
+
+    was_ready = False
+    try:
+        icon.run(setup=_tray_setup)
+        was_ready = APP.tray_ready.is_set()
+        if not APP.tray_stopping and not APP.shutting_down:
+            raise RuntimeError("O ícone da área de notificação foi encerrado.")
+    except Exception as exc:
+        was_ready = APP.tray_ready.is_set()
+        APP.tray_error = exc
+        APP.tray_ready.set()
+        LOGGER.error(
+            "Falha no ícone da área de notificação.\n\n"
+            "Traceback completo:\n%s",
+            _format_exception(exc),
+        )
+        if was_ready and not APP.tray_stopping and not APP.shutting_down:
+            UI_EVENTS.put(("tray_error", exc))
+
+
+def start_tray_icon() -> None:
+    """Inicia o loop nativo da bandeja fora da thread do Tkinter."""
+    APP.tray_ready.clear()
+    APP.tray_error = None
+    APP.tray_stopping = False
+    APP.tray_icon = pystray.Icon(
+        "ditado_inteligente",
+        icon=_create_tray_image(),
+        title=(
+            "Ditado inteligente — ativo "
+            f"({_hotkey_display_name(MAIN_HOTKEY)})"
+        ),
+        menu=_build_tray_menu(),
+    )
+    APP.tray_thread = threading.Thread(
+        target=_tray_run_loop,
+        name="system-tray",
+        daemon=True,
+    )
+    APP.tray_thread.start()
+
+    if not APP.tray_ready.wait(timeout=TRAY_START_TIMEOUT_SECONDS):
+        raise RuntimeError(
+            "O Windows não confirmou a criação do ícone da área de notificação."
+        )
+    if APP.tray_error is not None:
+        raise RuntimeError(
+            "Não foi possível criar o ícone da área de notificação."
+        ) from APP.tray_error
+
+
+def stop_tray_icon() -> None:
+    """Remove o ícone e encerra sua thread, se ela estiver ativa."""
+    APP.tray_stopping = True
+    icon = APP.tray_icon
+    thread = APP.tray_thread
+
+    if icon is not None:
+        try:
+            icon.stop()
+        except Exception as exc:
+            LOGGER.error(
+                "Falha ao remover o ícone da área de notificação.\n\n"
+                "Traceback completo:\n%s",
+                _format_exception(exc),
+            )
+
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=2.0)
+        if thread.is_alive():
+            LOGGER.warning(
+                "A thread do ícone da área de notificação não encerrou no prazo."
+            )
+
+    APP.tray_icon = None
+    APP.tray_thread = None
+    APP.tray_error = None
+    APP.tray_ready.clear()
 
 
 def load_prompt() -> str:
@@ -441,6 +694,8 @@ def _hotkey_modifiers_are_pressed() -> bool:
 
 def open_dictation_window() -> None:
     """Abre a janela intermediária, pronta para receber o ditado."""
+    if APP.shutting_down:
+        return
     if APP.window is not None and APP.window.winfo_exists():
         APP.window.lift()
         if APP.text_box is not None:
@@ -545,7 +800,7 @@ def open_dictation_window() -> None:
     text_box.focus_force()
     window.after(WINDOWS_DICTATION_DELAY_MS, trigger_windows_dictation)
 
-    print("Janela de ditado aberta.")
+    LOGGER.info("Janela de ditado aberta.")
 
 
 def start_rewrite() -> None:
@@ -568,7 +823,7 @@ def start_rewrite() -> None:
     _move_focus_away_from_dictation()
     if APP.status_label is not None:
         APP.status_label.configure(text="Reescrevendo texto...")
-    print("Reescrevendo texto...")
+    LOGGER.info("Reescrevendo texto...")
 
     operation_id = APP.operation_id
     thread = threading.Thread(
@@ -610,7 +865,7 @@ def cancel_operation(event: tk.Event | None = None) -> str | None:
     APP.operation_id += 1
     APP.busy = False
     _destroy_dictation_window()
-    print("Operação cancelada.")
+    LOGGER.info("Operação cancelada.")
     return "break" if event is not None else None
 
 
@@ -663,10 +918,9 @@ def _handle_clipboard_success(
     if copy_kind == "raw":
         _destroy_dictation_window()
         APP.busy = False
-        print(
+        LOGGER.info(
             "Texto bruto copiado para a área de transferência. "
-            "Pressione Ctrl + V onde desejar colá-lo.",
-            flush=True,
+            "Pressione Ctrl + V onde desejar colá-lo."
         )
         return
 
@@ -681,10 +935,9 @@ def _handle_clipboard_success(
             COPY_CONFIRMATION_DELAY_MS,
             lambda: _complete_copy_confirmation(operation_id),
         )
-    print(
+    LOGGER.info(
         "Texto copiado para a área de transferência. Pressione Ctrl + V "
-        "onde desejar colá-lo.",
-        flush=True,
+        "onde desejar colá-lo."
     )
 
 
@@ -833,6 +1086,137 @@ def _handle_rewrite_error(
         APP.text_box.focus_force()
 
 
+def open_log_window() -> None:
+    """Abre o histórico da sessão sem bloquear o restante da aplicação."""
+    if APP.shutting_down or APP.root is None:
+        return
+    if APP.log_window is not None and APP.log_window.winfo_exists():
+        APP.log_window.lift()
+        APP.log_window.focus_force()
+        return
+
+    window = tk.Toplevel(APP.root)
+    APP.log_window = window
+    APP.log_rendered_revision = -1
+    window.title("Mensagens da aplicação")
+    window.geometry("820x480")
+    window.minsize(620, 340)
+    window.protocol("WM_DELETE_WINDOW", _destroy_log_window)
+    window.bind("<Escape>", lambda event: _destroy_log_window())
+
+    container = ttk.Frame(window, padding=14)
+    container.pack(fill="both", expand=True)
+    container.columnconfigure(0, weight=1)
+    container.rowconfigure(1, weight=1)
+
+    if APP.log_file_path is None:
+        path_message = (
+            "Arquivo persistente indisponível; o histórico abaixo vale "
+            "somente para esta execução."
+        )
+    else:
+        path_message = f"Arquivo atual: {APP.log_file_path}"
+    ttk.Label(
+        container,
+        text=path_message,
+        wraplength=780,
+        justify="left",
+    ).grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+    text_frame = ttk.Frame(container)
+    text_frame.grid(row=1, column=0, sticky="nsew")
+    text_frame.columnconfigure(0, weight=1)
+    text_frame.rowconfigure(0, weight=1)
+
+    text_box = tk.Text(
+        text_frame,
+        wrap="none",
+        font=("Consolas", 10),
+        padx=8,
+        pady=8,
+        state="disabled",
+    )
+    APP.log_text_box = text_box
+    vertical_scrollbar = ttk.Scrollbar(
+        text_frame,
+        orient="vertical",
+        command=text_box.yview,
+    )
+    horizontal_scrollbar = ttk.Scrollbar(
+        text_frame,
+        orient="horizontal",
+        command=text_box.xview,
+    )
+    text_box.configure(
+        yscrollcommand=vertical_scrollbar.set,
+        xscrollcommand=horizontal_scrollbar.set,
+    )
+    text_box.grid(row=0, column=0, sticky="nsew")
+    vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+    horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+
+    actions = ttk.Frame(container)
+    actions.grid(row=2, column=0, sticky="e", pady=(10, 0))
+    open_folder_button = ttk.Button(
+        actions,
+        text="Abrir pasta dos logs",
+        command=open_log_folder,
+    )
+    if APP.log_file_path is None:
+        open_folder_button.configure(state="disabled")
+    open_folder_button.pack(side="left")
+    ttk.Button(
+        actions,
+        text="Fechar",
+        command=_destroy_log_window,
+    ).pack(side="left", padx=(8, 0))
+
+    window.update_idletasks()
+    _center_window(window)
+    window.lift()
+    window.focus_force()
+    _refresh_log_viewer()
+    LOGGER.info("Janela de mensagens aberta.")
+
+
+def open_log_folder() -> None:
+    if APP.log_file_path is None:
+        return
+
+    try:
+        os.startfile(APP.log_file_path.parent)  # type: ignore[attr-defined]
+    except OSError as exc:
+        _show_exception(
+            "Falha ao abrir os logs",
+            "Não foi possível abrir a pasta dos logs.",
+            exc,
+        )
+
+
+def _refresh_log_viewer() -> None:
+    if APP.log_window is None or APP.log_text_box is None:
+        return
+    try:
+        if not APP.log_window.winfo_exists():
+            return
+    except tk.TclError:
+        return
+
+    revision, messages = _log_history_snapshot()
+    if revision == APP.log_rendered_revision:
+        return
+
+    APP.log_text_box.configure(state="normal")
+    APP.log_text_box.delete("1.0", "end")
+    APP.log_text_box.insert(
+        "1.0",
+        "\n".join(messages) if messages else "Nenhuma mensagem registrada.",
+    )
+    APP.log_text_box.configure(state="disabled")
+    APP.log_text_box.see("end")
+    APP.log_rendered_revision = revision
+
+
 def _poll_ui_events() -> None:
     while True:
         try:
@@ -842,6 +1226,11 @@ def _poll_ui_events() -> None:
 
         if event_name == "open_window":
             open_dictation_window()
+        elif event_name == "open_log_window":
+            open_log_window()
+        elif event_name == "shutdown":
+            _request_application_shutdown()
+            break
         elif event_name == "rewrite_success":
             operation_id, final_text = payload
             _finish_rewrite(operation_id, final_text)
@@ -851,8 +1240,19 @@ def _poll_ui_events() -> None:
         elif event_name == "background_error":
             title, message = payload
             _show_error(title, message)
+        elif event_name == "tray_error":
+            details = _format_exception(payload)
+            _show_error(
+                "Falha na área de notificação",
+                "O ícone da área de notificação parou de funcionar e a "
+                "aplicação será encerrada."
+                f"\n\nTraceback completo:\n{details}",
+            )
+            _request_application_shutdown()
+            break
 
-    if APP.root is not None:
+    _refresh_log_viewer()
+    if APP.root is not None and not APP.shutting_down:
         APP.root.after(UI_POLL_INTERVAL_MS, _poll_ui_events)
 
 
@@ -897,6 +1297,34 @@ def _destroy_dictation_window() -> None:
     APP.closing_after_copy = False
 
 
+def _destroy_log_window() -> None:
+    if APP.log_window is not None:
+        try:
+            if APP.log_window.winfo_exists():
+                APP.log_window.destroy()
+        except tk.TclError as exc:
+            _print_exception("Falha ao fechar a janela de mensagens.", exc)
+
+    APP.log_window = None
+    APP.log_text_box = None
+    APP.log_rendered_revision = -1
+
+
+def _request_application_shutdown() -> None:
+    """Solicita uma saída limpa a partir da thread principal do Tkinter."""
+    if APP.shutting_down:
+        return
+
+    APP.shutting_down = True
+    APP.operation_id += 1
+    APP.busy = False
+    LOGGER.info("Encerrando a aplicação...")
+    _destroy_dictation_window()
+    _destroy_log_window()
+    if APP.root is not None:
+        APP.root.quit()
+
+
 def _center_window(window: tk.Toplevel) -> None:
     width = window.winfo_width()
     height = window.winfo_height()
@@ -918,7 +1346,11 @@ def _print_exception(
     traceback_details: str | None = None,
 ) -> None:
     details = traceback_details or _format_exception(exc)
-    print(f"{context}\n\nTraceback completo:\n{details}", flush=True)
+    message = f"{context}\n\nTraceback completo:\n{details}"
+    if LOGGER.handlers:
+        LOGGER.error(message)
+    else:
+        _write_console_fallback(message, error=True)
 
 
 def _show_exception(
@@ -930,7 +1362,10 @@ def _show_exception(
     """Exibe e registra uma falha sem omitir o traceback original."""
     details = traceback_details or _format_exception(exc)
     full_message = f"{message}\n\nTraceback completo:\n{details}"
-    print(f"{title}: {full_message}", flush=True)
+    if LOGGER.handlers:
+        LOGGER.error("%s: %s", title, full_message)
+    else:
+        _write_console_fallback(f"{title}: {full_message}", error=True)
     _show_error(title, full_message)
 
 
@@ -970,7 +1405,10 @@ def _report_thread_exception(args: Any) -> None:
         f"Ocorreu um erro inesperado na thread '{thread_name}'."
         f"\n\nTraceback completo:\n{traceback_details}"
     )
-    print(f"{title}: {message}", flush=True)
+    if LOGGER.handlers:
+        LOGGER.error("%s: %s", title, message)
+    else:
+        _write_console_fallback(f"{title}: {message}", error=True)
     if APP.root is not None:
         UI_EVENTS.put(("background_error", (title, message)))
 
@@ -979,8 +1417,38 @@ def _show_error(title: str, message: str) -> None:
     try:
         messagebox.showerror(title, message, parent=APP.window or APP.root)
     except tk.TclError as exc:
-        print(f"{title}: {message}")
+        if LOGGER.handlers:
+            LOGGER.error("%s: %s", title, message)
+        else:
+            _write_console_fallback(f"{title}: {message}", error=True)
         _print_exception("Falha ao exibir a caixa de erro.", exc)
+
+
+def _show_startup_exception(context: str, exc: BaseException) -> None:
+    """Registra e exibe uma falha mesmo quando não existe console ou Tk."""
+    details = _format_exception(exc)
+    _print_exception(context, exc, details)
+    log_hint = (
+        f"\n\nArquivo de log: {APP.log_file_path}"
+        if APP.log_file_path is not None
+        else ""
+    )
+    message = (
+        f"{context}\n\n{exc}\n\nTraceback completo:\n{details}{log_hint}"
+    )
+    try:
+        _windows_user32().MessageBoxW(
+            None,
+            message,
+            "Ditado inteligente",
+            MB_OK | MB_ICONERROR | MB_TOPMOST,
+        )
+    except Exception as notification_error:
+        _write_console_fallback(
+            "Também não foi possível exibir a mensagem nativa de erro: "
+            f"{notification_error}",
+            error=True,
+        )
 
 
 def _validate_startup() -> None:
@@ -997,15 +1465,33 @@ def _validate_startup() -> None:
     _parse_hotkey(MAIN_HOTKEY)
 
 
+def _cleanup_runtime(root: tk.Tk) -> None:
+    """Encerra todos os recursos que pertencem à instância atual."""
+    if not APP.shutting_down:
+        APP.operation_id += 1
+    APP.shutting_down = True
+    APP.busy = False
+    _destroy_dictation_window()
+    _destroy_log_window()
+    stop_tray_icon()
+    stop_global_hotkey()
+    try:
+        root.destroy()
+    except tk.TclError as exc:
+        _print_exception("Falha ao encerrar a interface.", exc)
+    APP.root = None
+
+
 def main() -> int:
     """Configura a interface oculta e registra o atalho global."""
     load_dotenv(BASE_DIR / ".env")
     threading.excepthook = _report_thread_exception
+    APP.shutting_down = False
 
     try:
         acquired = acquire_single_instance()
     except RuntimeError as exc:
-        _print_exception("Erro ao iniciar.", exc)
+        _show_startup_exception("Erro ao iniciar.", exc)
         return 1
 
     if not acquired:
@@ -1013,48 +1499,59 @@ def main() -> int:
         return 1
 
     try:
+        _configure_logging()
+        LOGGER.info("Iniciando o ditado inteligente.")
         try:
             _validate_startup()
         except ConfigurationError as exc:
-            _print_exception("Erro de configuração.", exc)
+            _show_startup_exception("Erro de configuração.", exc)
             return 1
 
-        root = tk.Tk()
+        try:
+            root = tk.Tk()
+        except Exception as exc:
+            _show_startup_exception("Não foi possível iniciar a interface.", exc)
+            return 1
+
         APP.root = root
         root.report_callback_exception = _report_tk_callback_exception
         root.withdraw()
 
         try:
-            start_global_hotkey()
-        except Exception as exc:
-            stop_global_hotkey()
-            _print_exception("Não foi possível registrar o atalho global.", exc)
-            root.destroy()
-            APP.root = None
-            return 1
-
-        root.after(UI_POLL_INTERVAL_MS, _poll_ui_events)
-        print(
-            f"Aguardando atalho {_hotkey_display_name(MAIN_HOTKEY)}...",
-            flush=True,
-        )
-        print("Pressione Ctrl + C no terminal para encerrar.")
-
-        try:
-            root.mainloop()
-        except KeyboardInterrupt:
-            print("Encerrando...")
-        finally:
-            stop_global_hotkey()
             try:
-                root.destroy()
-            except tk.TclError as exc:
-                _print_exception("Falha ao encerrar a interface.", exc)
-            APP.root = None
+                start_global_hotkey()
+                start_tray_icon()
+            except Exception as exc:
+                _show_startup_exception(
+                    "Não foi possível concluir a inicialização.",
+                    exc,
+                )
+                return 1
+
+            root.after(UI_POLL_INTERVAL_MS, _poll_ui_events)
+            LOGGER.info(
+                "Aguardando atalho %s...",
+                _hotkey_display_name(MAIN_HOTKEY),
+            )
+            if sys.stdout is not None:
+                LOGGER.info(
+                    "Pressione Ctrl + C no terminal ou use Encerrar no ícone "
+                    "da área de notificação."
+                )
+
+            try:
+                root.mainloop()
+            except KeyboardInterrupt:
+                LOGGER.info("Interrupção recebida pelo terminal.")
+        finally:
+            _cleanup_runtime(root)
 
         return 0
     finally:
         release_single_instance()
+        if LOGGER.handlers:
+            LOGGER.info("Aplicação encerrada.")
+        _close_logging_handlers()
 
 
 if __name__ == "__main__":
